@@ -1,0 +1,131 @@
+name: Build Darkest Fear Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Darkest Fear project
+        uses: actions/checkout@v4
+
+      - name: Checkout J2ME-Loader runtime
+        uses: actions/checkout@v4
+        with:
+          repository: nikita36078/J2ME-Loader
+          ref: master
+          path: runtime
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import pathlib, re
+          root = pathlib.Path("runtime/build.gradle").read_text()
+          def value(name, default):
+              m = re.search(r"\b" + re.escape(name) + r"\s*=\s*['\"]?([0-9]+(?:\.[0-9]+)*)", root)
+              return m.group(1) if m else default
+          print("RUNTIME_COMPILE_SDK=" + value("COMPILE_SDK", "35"))
+          print("RUNTIME_NDK_VERSION=" + value("NDK_VERSION", "27.2.12479018"))
+          PY
+          sdkmanager "platforms;android-${RUNTIME_COMPILE_SDK}" "build-tools;${RUNTIME_COMPILE_SDK}.0.0" "ndk;${RUNTIME_NDK_VERSION}"
+
+      - name: Verify original MIDlet JAR
+        run: |
+          python3 - <<'PY'
+          import zipfile
+          path = "game/darkest-fear-original.jar"
+          with zipfile.ZipFile(path) as z:
+              names = set(z.namelist())
+              assert "RMIDlet.class" in names, "RMIDlet.class missing"
+              assert "icon.png" in names, "icon.png missing"
+              manifest = z.read("META-INF/MANIFEST.MF").decode("latin-1")
+              assert "MIDlet-1:" in manifest and "RMIDlet" in manifest
+          print("Original Darkest Fear MIDlet verified.")
+          PY
+
+      - name: Bundle MIDlet into dedicated Android flavor
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p runtime/app/src/midlet/libs runtime/app/src/midlet/resources/MIDLET-META-INF
+          cp game/darkest-fear-original.jar runtime/app/src/midlet/libs/darkest-fear-original.jar
+          python3 - <<'PY'
+          import pathlib, zipfile
+          jar = pathlib.Path("game/darkest-fear-original.jar")
+          out = pathlib.Path("runtime/app/src/midlet/resources")
+          with zipfile.ZipFile(jar) as z:
+              for name in z.namelist():
+                  if name.endswith("/") or name.endswith(".class"):
+                      continue
+                  if name.upper().startswith("META-INF/"):
+                      continue
+                  target = out / name
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(z.read(name))
+          manifest = (
+              "Manifest-Version: 1.0\n"
+              "MIDlet-Name: Darkest Fear\n"
+              "MIDlet-Vendor: Rovio\n"
+              "MIDlet-Version: 1.19\n"
+              "MIDlet-1: Darkest Fear, /icon.png, RMIDlet\n"
+              "MicroEdition-Configuration: CLDC-1.0\n"
+              "MicroEdition-Profile: MIDP-1.0\n\n"
+          )
+          target = out / "MIDLET-META-INF" / "MANIFEST.MF"
+          target.parent.mkdir(parents=True, exist_ok=True)
+          target.write_text(manifest, encoding="utf-8")
+          PY
+
+      - name: Add original game classes to the MIDlet DEX
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("runtime/app/build.gradle")
+          s = p.read_text()
+          marker = "dependencies {"
+          if marker not in s:
+              raise SystemExit("Could not find dependencies block in upstream app/build.gradle")
+          line = "    midletImplementation files('src/midlet/libs/darkest-fear-original.jar')\n"
+          if line not in s:
+              s = s.replace(marker, marker + "\n" + line, 1)
+          p.write_text(s)
+          PY
+
+      - name: Build dedicated APK
+        working-directory: runtime
+        run: ./gradlew --no-daemon assembleMidletDebug
+
+      - name: Verify and upload APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$(find runtime/app/build/outputs/apk/midlet/debug -maxdepth 1 -name '*.apk' -print -quit)"
+          test -n "$APK"
+          test -s "$APK"
+          mkdir -p output
+          cp "$APK" output/Darkest-Fear-Android-debug.apk
+
+      - name: Upload installable APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Darkest-Fear-Android-debug-apk
+          path: output/Darkest-Fear-Android-debug.apk
+          if-no-files-found: error
